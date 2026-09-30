@@ -16,8 +16,73 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 249）。
 ## 运行方式
 
 ```bash
-./mvnw -q verify
+mvn -q verify        # 或 ./mvnw -q verify（需能下载 Maven 发行版）
 ```
+
+## 实现说明
+
+### 架构
+
+包 `com.example.gsb.vectorized`（`src/main/java`）：
+
+| 类 | 职责 |
+|----|------|
+| `ColumnVector` | 单列一批数据：`long[]`/`double[]`/`String[]` 定长或字符串值数组 + 位图 `nullMap` 记录 NULL |
+| `Table` / `ColumnBatch` | 不可变列式表；`Table.batches(n)` 把行区间 `[0, rowCount)` 连续、保序、不重不漏地切成批 |
+| `SelectionVector` | 位压缩选择向量：每行两位（`match`/`known`）承载三值结果，`and`/`or`/`not` 为纯按位字级合并，`concat` 跨批拼接 |
+| `FilterPredicate` 及实现 | 谓词树：`ComparisonPredicate`（GT/LT/EQ/BETWEEN）、`NullPredicate`（IS [NOT] NULL）、`LogicalPredicate`（AND/OR/NOT），工厂见 `Predicates` |
+| `VectorizedFilter` | 向量化引擎：逐批求值 → 选择向量拼接 → 按 TRUE 位升序物化 |
+| `RowWiseFilter` | 逐行参照实现：同一谓词树走 `RowView` 逐行求值，作为正确性基准 |
+| `MaterializedTable` | 物化结果：只含谓词为 TRUE 的行，保持源表行序，可回溯源行号 |
+
+### 空值与三值逻辑（3VL）
+
+遵循 SQL 语义：任何比较谓词（`>`、`<`、`=`、区间）遇到 NULL 结果都是
+**UNKNOWN**；`IS NULL` / `IS NOT NULL` 永远产生确定的 TRUE/FALSE。
+
+```
+AND:  FALSE 优先   —— FALSE AND UNKNOWN = FALSE，UNKNOWN AND TRUE = UNKNOWN
+OR :  TRUE  优先   —— TRUE  OR  UNKNOWN = TRUE， UNKNOWN OR FALSE = UNKNOWN
+NOT:  UNKNOWN 不变 —— NOT UNKNOWN = UNKNOWN
+```
+
+选择向量用两位编码：`known=0` 即 UNKNOWN（此时 `match` 恒为 0），
+`known=1` 时 `match` 区分 TRUE/FALSE。`and`/`or`/`not` 直接对 `long[]`
+字做位运算，无需逐行分支。物化时只有 TRUE 行被输出（SQL WHERE 语义），
+FALSE 与 UNKNOWN 行都被丢弃；需要 NULL 行时用 `isNull` 谓词显式选择。
+
+### 批次边界
+
+谓词都是针对常量的行级比较，因此每批独立求值即可。批是对行区间的连续
+切分，`SelectionVector.concat` 按批序把各批位向量精确拼回全表向量：
+区间边界值（含等于上下界的行）无论落在哪个批、是否正好在批切点上，
+都恰好被判断一次，不漏不重。`BatchBoundaryTest` 用 18 种批大小（含
+1、素数、跨 64 位字边界、整除/不整除）验证了这一点。
+
+### 用法示例
+
+```java
+Table table = Table.builder()
+        .addColumn("id",    ColumnVector.ofLong(ids, idNulls))
+        .addColumn("score", ColumnVector.ofDouble(scores, scoreNulls))
+        .addColumn("name",  ColumnVector.ofString(names, nameNulls))
+        .build();
+
+FilterPredicate p = Predicates.and(
+        Predicates.betweenLong("id", 100, 999),
+        Predicates.or(Predicates.gtDouble("score", 60.0),
+                      Predicates.isNull("score")));
+
+MaterializedTable out = new VectorizedFilter(4096).filter(table, p);
+```
+
+### 正确性与性能
+
+- `LargeDataCorrectnessTest`：20 万行随机数据（含 NULL），9 组谓词 × 5 种
+  批大小，向量化结果与逐行参照在**完整三值向量**与物化结果上逐一相等。
+- `VectorizedVsRowWisePerformanceTest`：200 万行、3 轮预热 + 6 轮计时，
+  硬校验两种实现结果完全一致，并打印/落盘耗时对比（`target/perf-results.txt`）。
+  本机参考：简单 BETWEEN 约 2.0x，复合谓词约 2.5–2.8x 加速。
 
 ## 任务提示词
 
